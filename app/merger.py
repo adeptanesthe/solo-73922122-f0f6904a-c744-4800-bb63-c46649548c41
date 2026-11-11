@@ -12,6 +12,8 @@ import json
 import tarfile
 from typing import BinaryIO, Iterable, Iterator
 
+from app.layerio import LayerStreamError, ValidatingLayerReader
+
 SUID_BIT = 0o4000
 SGID_BIT = 0o2000
 SPECIAL_BITS = SUID_BIT | SGID_BIT
@@ -371,11 +373,26 @@ def _map_outer_members(outer: tarfile.TarFile) -> dict[str, tarfile.TarInfo]:
     return members
 
 
+def _layer_stream_error(exc: LayerStreamError, layer: LayerInfo) -> ScanError:
+    return ScanError(
+        exc.code,
+        f"镜像层 {layer.number}（{layer.path}）校验失败：{exc.message}",
+        layer_number=layer.number,
+        layer_path=layer.path,
+    )
+
+
 def _parse_layer(
     outer: tarfile.TarFile,
     member: tarfile.TarInfo,
     layer: LayerInfo,
 ) -> tuple[list[FileRecord], list[str], list[str]]:
+    """Parse one layer tar with full compression and tail validation.
+
+    Parsing only collects metadata: no overlay state is mutated here, so a
+    failure in any later layer cannot leave a partially merged result behind.
+    """
+
     records: list[FileRecord] = []
     whiteouts: list[str] = []
     opaque_parents: list[str] = []
@@ -390,9 +407,11 @@ def _parse_layer(
         )
 
     try:
-        # r|* streams the layer and transparently detects gzip/xz/bz2,
-        # without writing any unpacked bytes anywhere.
-        with tarfile.open(fileobj=extracted, mode="r|*") as layer_tar:
+        # The validating reader detects gzip/xz/bz2 from magic bytes itself,
+        # keeps every read chunked, chains concatenated members, verifies
+        # checksums and end-of-stream state, and never touches the disk.
+        reader = ValidatingLayerReader(extracted)
+        with tarfile.open(fileobj=reader, mode="r|") as layer_tar:
             for tar_info in layer_tar:
                 try:
                     path = normalize_archive_path(
@@ -472,6 +491,12 @@ def _parse_layer(
                         gid=int(tar_info.gid or 0),
                     )
                 )
+            # The tar end-of-archive marker has been reached.  Drain the rest
+            # of the decompressed stream and verify every compressed member
+            # ended properly with a valid trailer and checksum.
+            reader.drain_and_verify()
+    except LayerStreamError as exc:
+        raise _layer_stream_error(exc, layer) from exc
     except ScanError:
         raise
     except (tarfile.TarError, EOFError, OSError, UnicodeError) as exc:
@@ -546,7 +571,10 @@ def scan_docker_archive(fileobj: BinaryIO) -> ScanResult:
             config_path = None
 
         layers: list[LayerInfo] = []
-        root = _Node()
+        # Parse and validate every referenced layer before touching the
+        # virtual filesystem: a corrupt or truncated layer must fail the whole
+        # scan rather than yield a partially merged result.
+        parsed_layers: list[tuple[list[FileRecord], list[str], list[str]]] = []
 
         for manifest_index, raw_layer_path in enumerate(raw_layers):
             try:
@@ -596,9 +624,17 @@ def scan_docker_archive(fileobj: BinaryIO) -> ScanResult:
                 path=layer_path,
                 name=_layer_name(layer_path),
             )
-            records, whiteouts, opaque_parents = _parse_layer(outer, member, layer)
-            _apply_layer(root, records, whiteouts, opaque_parents, layer)
+            parsed = _parse_layer(outer, member, layer)
             layers.append(layer)
+            parsed_layers.append(parsed)
+
+        # All referenced layers passed structural, checksum and tail checks;
+        # only now apply the original overlay merge rules in manifest order.
+        root = _Node()
+        for layer, (records, whiteouts, opaque_parents) in zip(
+            layers, parsed_layers
+        ):
+            _apply_layer(root, records, whiteouts, opaque_parents, layer)
 
         files = _collect_privileged(root)
 

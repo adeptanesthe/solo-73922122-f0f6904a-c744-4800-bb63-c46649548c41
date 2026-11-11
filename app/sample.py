@@ -2,15 +2,21 @@
 
 No demo bytes are unpacked to disk.  The outer archive and every inner layer
 are assembled in BytesIO objects and parsed by the same streaming scanner that
-handles uploaded archives.
+handles uploaded archives.  The four layers intentionally use every supported
+encoding -- uncompressed tar, concatenated gzip (the member boundary falls
+inside a tar header), xz and bzip2 -- so the demo proves that all of them go
+through the same integrity-validating reader.
 """
 
 from __future__ import annotations
 
+import bz2
 from functools import lru_cache
+import gzip
 import hashlib
 import io
 import json
+import lzma
 import tarfile
 
 DEMO_TAG = "demo/privilege-audit:latest"
@@ -237,6 +243,27 @@ def _file_to_directory_layer() -> bytes:
     )
 
 
+def _split_gzip(payload: bytes) -> bytes:
+    """Gzip a tar as two concatenated members.
+
+    The split point sits inside the first 512-byte tar header on purpose, to
+    demonstrate that member boundaries need not align with tar entries.
+    """
+
+    split = 300
+    return gzip.compress(payload[:split]) + gzip.compress(payload[split:])
+
+
+# Layer encoding, in manifest order.  Every layer still flows through the same
+# ValidatingLayerReader as uploads; the first layer stays uncompressed.
+_LAYER_ENCODINGS = (
+    ("", lambda payload: payload),
+    (".gz", _split_gzip),
+    (".xz", lambda payload: lzma.compress(payload, format=lzma.FORMAT_XZ)),
+    (".bz2", bz2.compress),
+)
+
+
 @lru_cache(maxsize=1)
 def build_demo_archive() -> bytes:
     """Build a deterministic single-image docker-save tar in memory."""
@@ -249,10 +276,12 @@ def build_demo_archive() -> bytes:
     ]
     layer_paths: list[str] = []
     diff_ids: list[str] = []
-    for payload in layer_payloads:
-        digest = hashlib.sha256(payload).hexdigest()
-        diff_ids.append("sha256:" + digest)
-        layer_paths.append("blobs/sha256/" + digest)
+    for payload, (suffix, encode) in zip(layer_payloads, _LAYER_ENCODINGS):
+        # diff_id hashes the uncompressed tar; the blob path/digest
+        # identifies the stored (possibly compressed) bytes.
+        diff_ids.append("sha256:" + hashlib.sha256(payload).hexdigest())
+        blob = encode(payload)
+        layer_paths.append("blobs/sha256/" + hashlib.sha256(blob).hexdigest() + suffix)
 
     config = {
         "architecture": "amd64",
@@ -310,14 +339,17 @@ def build_demo_archive() -> bytes:
         info.mtime = _MTIME
         outer.addfile(info, io.BytesIO(config_bytes))
 
-        for path, payload in zip(layer_paths, layer_payloads):
+        for path, payload, (_, encode) in zip(
+            layer_paths, layer_payloads, _LAYER_ENCODINGS
+        ):
+            blob = encode(payload)
             info = tarfile.TarInfo(path)
             info.mode = 0o644
             info.uid = 0
             info.gid = 0
-            info.size = len(payload)
+            info.size = len(blob)
             info.mtime = _MTIME
-            outer.addfile(info, io.BytesIO(payload))
+            outer.addfile(info, io.BytesIO(blob))
 
     return buffer.getvalue()
 

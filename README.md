@@ -98,14 +98,21 @@ curl -sS -F archive=@examples/multilayer-demo.tar \
 ```json
 {
   "detail": {
-    "code": "hardlink_unsupported",
-    "message": "不支持硬链接（hard link）：/hard（层 2）",
-    "path": "/hard",
+    "code": "layer_compression_truncated",
+    "message": "镜像层 2（blobs/sha256/...tar.gz）校验失败：gzip 成员 1 未正常结束：压缩流尾部缺失或数据被截断",
     "layer_number": 2,
-    "layer_path": "blobs/sha256/..."
+    "layer_path": "blobs/sha256/...tar.gz"
   }
 }
 ```
+
+压缩相关错误码：
+
+| code | 触发条件 |
+| --- | --- |
+| `layer_compression_truncated` | gzip/xz/bz2 流在结束标记前被截断，或缺少 gzip 尾部（任一拼接成员） |
+| `layer_compression_corrupt` | gzip CRC32/ISIZE、xz CRC 或 bzip2 CRC 校验失败，或压缩数据损坏 |
+| `layer_tail_invalid` | tar 结束标记之后存在非零字节，或压缩流结束后夹带非法数据 |
 
 ## 合并规则
 
@@ -130,11 +137,17 @@ curl -sS -F archive=@examples/multilayer-demo.tar \
 
 - 只调用 `tarfile` 读取外层归档与内层层 tar 的头/成员流。
 - 没有 `extract()`、`extractall()`，也不会写入任何解包后的文件。
-- 层 tar 通过流式 `r|*` 读取，支持未压缩、gzip、xz、bz2 层。
+- 层通过 `app/layerio.py` 的分块校验读取器流式读取，未压缩、gzip、xz、bz2 层共用同一条读取路径：
+  - **读完整条压缩流**并验证结束状态：gzip 尾部缺失、流被截断会以 `layer_compression_truncated` 失败，而不是看到 tar 结束标记就放行；
+  - **强制校验和**：gzip CRC32/ISIZE、xz CRC、bzip2 CRC 任一错误以 `layer_compression_corrupt` 失败；
+  - **拼接成员按同一解压字节流处理**：多成员 gzip、拼接 xz/bz2 流被透明拼接，成员边界可以落在 tar 头或文件正文中；任一成员损坏或截断即整体失败；
+  - **校验 tar 结束标记之后的字节**：仅允许全零填充块，任何非零尾随数据以 `layer_tail_invalid` 失败；
+  - 全程固定 64 KiB 分块，整层不会驻留内存，也不会解包落盘。
+- 所有 `manifest.json` 引用层都通过校验后才应用合并并返回原扫描结果；任一层失败返回 HTTP 400，`detail` 中注明 `layer_number`、`layer_path` 与原因，不返回部分结果。
 - 所有成员路径在合并前校验；符号链接层引用会被拒绝。
 - 不解析符号链接、不跟随硬链接。
 - 服务容器只读、非 root、`cap_drop: ALL`。
-- UI 使用 `textContent` 渲染扫描结果，避免镜像内恶意路径造成 XSS；并设置 CSP。
+- UI 使用 `textContent` 渲染扫描结果，避免镜像内恶意路径造成 XSS；并设置 CSP。发起新扫描（或重新选择文件）时会先清空旧清单，因此失败后再上传合法镜像仍可正常扫描。
 
 > 上传文件本身由 ASGI/Starlette 暂存（默认超过 1 MiB 会落到 `/tmp`）。Compose 把 `/tmp` 挂为 tmpfs；这只是上传字节的暂存，不是归档解包。若扫描较大的真实镜像，可通过 `UPLOAD_TMP_SIZE` 调整 tmpfs 大小。
 
@@ -166,11 +179,12 @@ python3 app/sample.py examples/multilayer-demo.tar
 ```text
 app/
   main.py        FastAPI 路由、上传与错误响应
+  layerio.py     分块校验读取器：gzip/xz/bz2 拼接、校验和与结束状态、tar 尾部校验
   merger.py      只读 tar 解析、层合并、SUID/SGID 收集
-  sample.py      内存中生成四层 docker-save 示例
+  sample.py      内存中生成四层 docker-save 示例（未压缩/拼接 gzip/xz/bz2）
   static/        网页、样式和前端逻辑
 examples/        内置示例 tar 与说明
-tests/           合并规则与安全边界测试
+tests/           合并规则、压缩完整性与安全边界测试
 Dockerfile
 docker-compose.yml
 ```

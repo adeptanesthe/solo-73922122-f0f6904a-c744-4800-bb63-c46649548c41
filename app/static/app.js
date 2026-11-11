@@ -30,6 +30,21 @@ const emptyState = byId("empty-state");
 let selectedFile = null;
 let busy = false;
 
+function clearResults() {
+  results.hidden = true;
+  resultSubtitle.textContent = "";
+  metricLayers.textContent = "0";
+  metricFiles.textContent = "0";
+  metricSuid.textContent = "0";
+  metricSgid.textContent = "0";
+  layerStrip.replaceChildren();
+  findingsBody.replaceChildren();
+  tableWrap.hidden = true;
+  emptyState.hidden = true;
+  safetyNote.hidden = true;
+  safetyNote.textContent = "";
+}
+
 function el(tag, className, text) {
   const node = document.createElement(tag);
   if (className) node.className = className;
@@ -129,7 +144,7 @@ function chooseFile(file) {
   if (busy) return;
   selectedFile = file || null;
   setError(null);
-  results.hidden = true;
+  clearResults();
 
   if (!selectedFile) {
     input.value = "";
@@ -262,6 +277,8 @@ function renderResult(payload) {
 async function runScan({ file, demo }) {
   if (busy) return;
   setError(null);
+  // Never show a previous scan's list alongside a new failure or result.
+  clearResults();
   setBusy(true, demo ? "构建并扫描示例" : "扫描并合并层");
   setStatus(demo ? "正在内存中构建四层示例归档并合并…" : "正在读取 tar 头并合并 whiteout 规则…");
 
